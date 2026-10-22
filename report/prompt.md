@@ -10,29 +10,48 @@
 **输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 部分提供的信息，以工程真实代码为准，不要引入无关功能。
 
 [RELY]
+
 // 1. 物理内存与地址转换相关的宏定义 (参考 memlayout.h / pmm.h)
+
 #define PGSIZE 4096 // 页大小
+
 #define DRAM_BASE 0x80000000 // QEMU DRAM 起始物理地址
-#define KERNBASE 0xFFFFFFFFC0000000 // 内核高地址虚拟空间起始基址
+
+#define KERNBASE 0xFFFFFFFFC0000000 // 内核高地址虚拟空间起始
+基址
+
 #define PPN(pa) ((pa) >> 12) // 物理地址转物理页号
+
 #define PADDR(kva) ({ uintptr_t __m_kva = (uintptr_t)(kva); if (__m_kva < KERNBASE) { panic("PADDR called with invalid kva"); } __m_kva - va_pa_offset; }) // 内核虚拟地址转物理地址
 
 // 2. 数据结构
+
 struct Page {
+
     // 框架自带的 Page 结构，重点使用以下相关宏/函数：
-    // SetPageReserved(p), ClearPageReserved(p), PageReserved(p)
+
+    // SetPageReserved(p), ClearPageReserved(p), 
+    PageReserved(p)
+
     // p->property (该连续空闲块的大小)
 };
 
 // 3. 可用的全局变量及函数
+
 // 设备树探测结果（由 dtb_init 提前初始化）
+
 uint64_t get_memory_base(void); 
+
 uint64_t get_memory_size(void);
 
 // pmm 框架全局变量
+
 extern struct Page *pages;      // Page 描述符数组的首地址（虚拟地址）
+
 extern size_t npage;            // 内核可管理的物理页号上界 (总物理页数)
+
 extern uint64_t va_pa_offset;   // 虚拟地址与物理地址的偏移量
+
 extern const size_t nbase;      // DRAM_BASE / PGSIZE
 
 // 链接脚本符号
@@ -40,8 +59,11 @@ extern char end[];              // 内核代码结尾的虚拟地址
 
 // 可用函数
 void panic(const char *fmt, ...); // 报错并终止
+
 int cprintf(const char *fmt, ...); // 内核打印
+
 void init_memmap(struct Page *base, size_t n); // 将连续物理页 base 开始的 n 页交给 pmm_manager 初始化
+
 struct Page *pa2page(uintptr_t pa); // 物理地址转 Page 结构体指针
 
 [GUARANTEE]

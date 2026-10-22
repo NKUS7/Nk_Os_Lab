@@ -109,7 +109,7 @@ static void page_init(void);
 
 **功能说明：**
 
-[本模块主要负责操作系统启动初期的物理内存探测与页描述符初始化，是后续所有内存分配算法（First-Fit、Best-Fit、Buddy、SLUB）能够正常运行的基础。
+本模块主要负责操作系统启动初期的物理内存探测与页描述符初始化，是后续所有内存分配算法（First-Fit、Best-Fit、Buddy、SLUB）能够正常运行的基础。
 
     该模块在整个系统中的作用：
 
@@ -137,7 +137,7 @@ static void page_init(void);
 
         下游交互：依赖设备树解析模块（如 get_memory_base()、get_memory_size()）获取内存信息；依赖于链接脚本符号 end 来计算内核结束地址；通过 init_memmap() 与功能模块二（物理内存分配功能）进行交互，将空闲页链表的初始状态传递给具体的分配器（如 First-Fit 或 Best-Fit）。
 
-        全局状态维护：成功执行后，需要正确设置全局变量 va_pa_offset（虚实地址偏移量）、npage（总物理页数）和 pages（Page 数组基址），并通过 cprintf() 打印探测到的物理内存范围。]
+        全局状态维护：成功执行后，需要正确设置全局变量 va_pa_offset（虚实地址偏移量）、npage（总物理页数）和 pages（Page 数组基址），并通过 cprintf() 打印探测到的物理内存范围。
 
 #### 最终提示词
 
@@ -145,7 +145,7 @@ static void page_init(void);
 
 ````markdown
 
-[[PROMPT]
+[PROMPT]
 **任务**：修改文件 `kern/mm/pmm.c`，实现或完善 `page_init` 函数。该函数负责从设备树获取物理内存信息，建立 `struct Page` 描述符数组布局，排除 OpenSBI、内核镜像和描述符数组占用的空间后，将剩余的完整空闲物理页交给当前 `pmm_manager` 管理。
 
 **操作要求**：你必须在项目中修改实际文件，保留文件中的现有代码，只在你需要补全的函数 `page_init` 及其附近位置进行修改和补充。不要删除既有逻辑，不要修改无关文件。
@@ -232,7 +232,6 @@ static void page_init(void);
   **Case 3**: (无可用空闲页面)
   - **触发条件**：经过对齐和扣除后，空闲物理内存起点 >= 空闲物理内存终点。
   - **执行行为**：**不得**调用 `init_memmap()`。通过 `cprintf()` 打印警告信息，告知没有可用空闲页面。
-]
 
 ````
 
