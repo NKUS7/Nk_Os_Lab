@@ -5,6 +5,138 @@
 
 //lab2 function2-2 YOUR CODE
 
+static free_area_t best_fit_free_area;
+
+#define free_list (best_fit_free_area.free_list)
+#define nr_free (best_fit_free_area.nr_free)
+
+static void
+best_fit_init(void) {
+    list_init(&free_list);
+    nr_free = 0;
+}
+
+// Insert a free block while keeping the list ordered by physical address.
+static void
+best_fit_insert_free_block(struct Page *base) {
+    assert(base != NULL);
+    assert(PageProperty(base));
+
+    list_entry_t *le = &free_list;
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        if (base < p) {
+            list_add_before(le, &base->page_link);
+            return;
+        }
+    }
+    list_add_before(&free_list, &base->page_link);
+}
+
+static void
+best_fit_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0);
+    assert(base != NULL);
+
+    struct Page *p = base;
+    for (; p != base + n; p++) {
+        assert(PageReserved(p));
+        p->flags = 0;
+        p->property = 0;
+        set_page_ref(p, 0);
+    }
+
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+    best_fit_insert_free_block(base);
+}
+
+static struct Page *
+best_fit_alloc_pages(size_t n) {
+    assert(n > 0);
+    if (n > nr_free) {
+        return NULL;
+    }
+
+    // Scan every free block so that the smallest sufficient block wins.
+    // The list is address-ordered, so retaining the first match on ties also
+    // gives the required lowest-address tie-break.
+    struct Page *page = NULL;
+    list_entry_t *le = &free_list;
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        if (p->property >= n &&
+            (page == NULL || p->property < page->property)) {
+            page = p;
+        }
+    }
+
+    if (page == NULL) {
+        return NULL;
+    }
+
+    list_entry_t *prev = list_prev(&page->page_link);
+    list_del(&page->page_link);
+    if (page->property > n) {
+        struct Page *remaining = page + n;
+        remaining->property = page->property - n;
+        SetPageProperty(remaining);
+        list_add(prev, &remaining->page_link);
+    }
+
+    nr_free -= n;
+    ClearPageProperty(page);
+    return page;
+}
+
+static void
+best_fit_free_pages(struct Page *base, size_t n) {
+    assert(n > 0);
+    assert(base != NULL);
+
+    struct Page *p = base;
+    for (; p != base + n; p++) {
+        assert(!PageReserved(p) && !PageProperty(p));
+        p->flags = 0;
+        p->property = 0;
+        set_page_ref(p, 0);
+    }
+
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+    best_fit_insert_free_block(base);
+
+    // Merge with the physically preceding block when they are adjacent.
+    list_entry_t *le = list_prev(&base->page_link);
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (p + p->property == base) {
+            p->property += base->property;
+            ClearPageProperty(base);
+            list_del(&base->page_link);
+            base = p;
+        }
+    }
+
+    // Merge with the physically following block when they are adjacent.
+    le = list_next(&base->page_link);
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (base + base->property == p) {
+            base->property += p->property;
+            ClearPageProperty(p);
+            list_del(&p->page_link);
+        }
+    }
+}
+
+static size_t
+best_fit_nr_free_pages(void) {
+    return nr_free;
+}
+
 // Framework tests: students must not modify basic_check or best_fit_check.
 static void
 basic_check(void) {
@@ -136,3 +268,13 @@ best_fit_check(void) {
     cprintf("grading: %d / %d points\n", score, sumscore);
     #endif
 }
+
+const struct pmm_manager best_fit_pmm_manager = {
+    .name = "best_fit_pmm_manager",
+    .init = best_fit_init,
+    .init_memmap = best_fit_init_memmap,
+    .alloc_pages = best_fit_alloc_pages,
+    .free_pages = best_fit_free_pages,
+    .nr_free_pages = best_fit_nr_free_pages,
+    .check = best_fit_check,
+};
