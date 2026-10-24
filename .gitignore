@@ -1,0 +1,20 @@
+# Compiler and linker intermediate files
+*.o
+*.d
+*.asm
+*.sym
+
+# Build output directories
+/code/obj/
+/code/bin/
+
+# Generated debug files
+/code/.gdb.in
+/code/.qemu.out
+
+# Code index and editor tag files
+/code/cscope.*
+/code/tags
+
+# Generated submission archive
+/code/proj*-handin.tar.gz
