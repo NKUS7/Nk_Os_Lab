@@ -81,7 +81,49 @@ void print_regs(struct pushregs *gpr) {
 }
 
 //lab3 function2 YOUR CODE
+// 艾思奇 2410796
 
+static uintptr_t instruction_length(uintptr_t epc) {
+    uint16_t inst = *(volatile uint16_t *)epc;
+    return (inst & 0x3) == 0x3 ? 4 : 2;
+}
+
+void interrupt_handler(struct trapframe *tf) {
+    uintptr_t cause = tf->cause & ~((uintptr_t)1 << 63);
+
+    switch (cause) {
+    case IRQ_S_TIMER:
+        ticks++;
+        clock_set_next_event();
+        if (ticks % TICK_NUM == 0) {
+            print_ticks();
+        }
+        break;
+    case IRQ_S_SOFT:
+        cprintf("Supervisor software interrupt\n");
+        break;
+    default:
+        cprintf("Unknown interrupt: cause %d\n", (int)cause);
+        print_trapframe(tf);
+        break;
+    }
+}
+
+void exception_handler(struct trapframe *tf) {
+    switch (tf->cause) {
+    case CAUSE_BREAKPOINT:
+        cprintf("Breakpoint at 0x%lx\n", tf->epc);
+        tf->epc += instruction_length(tf->epc);
+        break;
+    case CAUSE_ILLEGAL_INSTRUCTION:
+        cprintf("Illegal instruction at 0x%lx\n", tf->epc);
+        tf->epc += instruction_length(tf->epc);
+        break;
+    default:
+        print_trapframe(tf);
+        break;
+    }
+}
 
 static inline void trap_dispatch(struct trapframe *tf) {
     if ((intptr_t)tf->cause < 0) {
