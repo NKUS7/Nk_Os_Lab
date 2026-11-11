@@ -4,18 +4,17 @@
 
 | 项目 | 内容 |
 |------|------|
-| **实验名称** | Lab 3: [中断处理机制] |
+| **实验名称** | Lab 4: [进程管理] |
 | **小组成员** | 2410796-艾思奇、2412806-阳雨洁 |
-| **完成日期** | 2026-11-03 |
+| **完成日期** | 2026-11-11 |
 
 ### 小组分工
 
-练习如何分工？
-
 | 成员 | 负责的练习/模块 |
 |------|----------------|
-| 2410796-艾思奇 | [模块二] |
-| 2412806-阳雨洁 | [模块一] |
+| 2410796-艾思奇 |  |
+| 2412806-阳雨洁 | 功能模块一、功能模块二 |
+
 
 ---
 
@@ -25,10 +24,11 @@
 
 本实验的主要目的是：
 
-1. [理解 RISC-V 的中断/异常机制、特权级划分与相关 CSR 寄存器]
-2. [理解中断前后上下文环境的保存与恢复方法，掌握 trapframe 的数据布局]
-3. [掌握中断入口点、C 语言处理函数与中断返回之间的衔接流程]
-4. [为后续实现时钟中断、断点异常等具体中断处理打下基础]
+1. [理解 Sv39 多级页表的结构，掌握运行时建立、更新与撤销虚拟地址映射的方法]
+2. [理解进程控制块（PCB）、内核栈、trapframe 与 context 的组织方式]
+3. [掌握 idleproc 与 initproc 的创建流程，理解 kernel_thread → do_fork → copy_thread 的首次运行链路]
+4. [理解内核线程与用户进程的区别：内核线程仅运行在内核态、共享内核地址空间]
+5. [理解进程调度与上下文切换的基本原理，为后续实验中的用户进程、系统调用与缺页处理打基础]
 
 ---
 
@@ -42,6 +42,7 @@
 | 2412806-阳雨洁 | vscode的claude插件 | [DeepSeek-V4-Flash] | 无 |
 
 **说明：**
+
 - **AI 编程工具**：指具体使用的终端工具、编辑器插件、桌面应用或浏览器界面
 - **底层模型**：指该工具使用的大语言模型及版本
 
@@ -51,45 +52,50 @@
 
 ### 2.1 本章节的逻辑主线
 
-- 本章实验的核心主题是操作系统的中断处理机制。操作系统作为计算机系统的监管者，必须能够对系统状态的突发变化（程序异常、外设请求、时钟到期等）及时做出响应：暂停当前执行流，陷入内核处理，处理结束后再回到被打断的位置继续执行。
+- 本章实验的核心主题是操作系统的进程与线程管理。在前面的实验中，内核已经具备物理内存管理、基础页表机制和 Trap 处理能力，但仍然以单一执行流的方式运行，无法并发执行多个任务，也没有体现虚拟内存机制在进程/线程隔离中的作用。
 
-- 在 RISC-V 中，中断（interrupt）与异常（exception）统称为 Trap。中断是异步事件，由外部设备或时钟触发；异常是同步事件，由当前指令触发（如非法指令、缺页、`ecall`、`ebreak`）。中断处理需要更高权限，因此通常运行在 S 模式（OpenSBI 等 M 模式固件已完成中断委托），内核通过 `stvec` 指定 Trap 入口，通过 `sepc`、`scause`、`stval`、`sstatus` 等 CSR 获知现场并完成返回。
+- Lab4 在此基础上完成两方面扩展：一是进一步完善虚拟内存管理，引入 `mm_struct` / `vma_struct`，为每个执行实体提供逻辑上的地址空间（本实验采用预映射方式，不涉及按需分页和页面置换）；二是引入内核线程机制，实现进程控制块、上下文切换和调度器，让多个内核线程轮流使用 CPU。
 
-- 本章要解决的核心问题是：Trap 发生时如何保存被打断程序的完整上下文，如何把上下文交给 C 语言函数处理，以及处理完成后如何原样恢复上下文并通过 `sret` 返回。本实验用一个 `struct trapframe` 描述保存的寄存器布局，并用 `trapentry.S` 中的汇编代码完成“保存上下文 → 调用 `trap()` → 恢复上下文 → `sret`”的闭环。时钟中断、断点异常等具体处理则位于 `trap.c` 中。
+- 需要特别注意：ucore 对线程和进程做了统一处理，都用 `proc_struct` 表示。由于所有内核线程共享同一个内核地址空间，它们从属于同一个唯一的内核进程。本实验创建的是内核线程，`current->mm == NULL`，`copy_mm()` 只保留接口形态。
+
+| 比较项 | 内核线程 | 用户进程 |
+|--------|----------|----------|
+| 运行模式 | 仅在内核态运行 | 在用户态和内核态之间切换 |
+| 地址空间 | 共享内核地址空间 | 拥有独立的用户虚拟地址空间 |
+
+- 本实验的最终目标是：系统启动后至少存在 `idleproc` 与 `initproc` 两个关键线程，并在调度器作用下让 `initproc` 被真正切换执行。
 
 ### 2.2 功能的逐步实现
 
-本章实验的推进顺序是先从 Trap 的硬件机制过渡到软件入口，再进入具体中断的分类处理，具体步骤如下：
+本章实验的推进顺序是：先补齐前序实验代码，再实现动态页表映射，随后构造 PCB 与内核线程，最后实现调度与上下文切换。具体步骤如下：
 
-    0. 前置工作：补齐 Lab2 的物理内存管理代码（page_init、Best-Fit 等）
+    0. 前置工作：补齐 Lab2 / Lab3 的代码
 
-        做了什么：将 Lab2 中的 page_init() 以及 best_fit_pmm.c 的分配器实现原样补充到 Lab3 工程中，使 pmm_init() 能完成物理内存探测、Page 描述符初始化与空闲页注册。
+        做了什么：把 Lab2 的 page_init()、Best-Fit 物理内存分配器，以及 Lab3 的 Trap 入口/上下文恢复与中断/异常处理代码补充到 Lab4 工程中。
 
-        为什么先做这个：Lab3 的时钟中断、后续实验的内存管理都建立在可用的物理内存管理之上，且 Lab3 框架中保留的 default_pmm.c 已经是 Lab2 的完成版本，补齐其余部分是为了保证工程处于与 Lab2 一致的可用状态。
+        为什么先做这个：Lab4 的 pmm_init()、时钟中断和进程切换都建立在物理内存管理、页表机制和 Trap 闭环之上；如果前置代码缺失，内核无法完成初始化，也无法进入调度流程。
 
-    1. 理解 RISC-V 的 Trap 机制与相关寄存器
+    1. 实现动态页表映射（功能模块一：page_insert / page_remove
 
-        做了什么：学习 stvec、sepc、scause、stval、sstatus 的作用，理解 U/S/M 三种特权级以及硬件在陷入 S 模式时自动完成的操作（保存 sepc、写入 scause/stval、SIE→SPIE 并清零 SIE、SPP 记录来源特权级、PC←stvec）。
+        做了什么：在 get_pte() 定位页表项的基础上，实现 page_insert() 建立/更新“虚拟地址 → 物理页”的映射，实现 page_remove() 幂等撤销映射，并维护物理页引用计数、PTE 权限位和 TLB 一致性。
 
-        为什么先理解这个：不弄清硬件自动做了什么、软件还需要做什么，就无法正确编写 Trap 入口；上下文保存/恢复的每一项都必须与硬件行为对应。
+        为什么接着实现这个：进程/线程的地址空间最终由页表描述；没有运行时建立和撤销映射的能力，就无法维护进程地址空间，也无法通过 check_pgdir() 等页表自检。
 
-    2. 实现 Trap 入口与上下文保存/恢复（功能模块一：trapentry.S）
+    2. 实现 PCB 与内核线程创建（功能模块二：alloc_proc / proc_init / kernel_thread / do_fork / copy_thread / copy_mm）
 
-        做了什么：在已有 SAVE_ALL 的基础上实现 RESTORE_ALL 宏，并在 __alltraps 中把当前 Trap frame 地址按调用约定放入 a0、调用 trap()，返回后进入 __trapret，由 RESTORE_ALL 恢复上下文并执行 sret。
+        做了什么：实现 PCB 的分配与初始化；把当前执行现场包装成 idleproc；通过 kernel_thread(init_main, ...) 创建 initproc；完成 do_fork 的资源分配、内核栈建立、trapframe/context 构造、PID 分配、链表挂接和状态置位。
 
-        为什么接着实现这个：这是所有中断处理的公共入口。没有正确的上下文保存与恢复，任何具体中断处理程序都无法安全运行；该模块也是模块二（trap.c 中的分发与处理）能够被调用的前提。
+        为什么然后实现这个：调度器必须要有可调度的 PCB；idleproc 和 initproc 是后续所有进程/线程创建与调度的起点。
 
-    3. 实现中断分发与具体中断处理（功能模块二：trap.c）
+    3. 实现调度与上下文切换（功能模块三：schedule / proc_run / switch_to / cpu_idle）
 
-        做了什么：实现 trap_dispatch() 对中断/异常的分类，实现 interrupt_handler()（时钟中断、累加 ticks、设置下一次时钟事件）与 exception_handler()（断点异常等），并完成 idt_init() 中 stvec 的设置。
+        做了什么：实现 schedule() 的 Round-Robin 选择逻辑——先清除 current->need_resched；若 current 不是 idleproc，则从 current->list_link 的下一个节点开始遍历 proc_list；若 current 是 idleproc，则从链表头开始；找到第一个 PROC_RUNNABLE 的线程作为 next，若遍历完仍未找到则回退到 idleproc。实现 proc_run()——把 current 指向 next，切换页表（RISC-V 下由 next->pgdir 设置 satp），并调用 switch_to(&prev->context, &next->context) 完成上下文切换。实现 switch.S 中的 switch_to——按 struct context 的字段顺序保存 ra/sp/s0~s11，再从目标 context 恢复。实现 cpu_idle()——循环检查 current->need_resched，必要时调用 schedule()，使 CPU 在没有其他就绪线程时停留在 idle 循环。
 
-        为什么然后实现这个：模块一只负责“进得来、回得去”，模块二才决定“进来之后做什么”。时钟中断用于验证整个 Trap 闭环，断点异常用于验证异常路径。
+        为什么最后实现这个：只有在 PCB 与内核线程创建完成后，调度器才有对象可选；上下文切换也是验证“多执行流并发”的最后一步。调度器通过 proc_list 把 idleproc、initproc 以及后续创建的线程统一管理起来，使系统从单一执行流真正进入多线程轮转。
 
-    4. 理解中断的关闭与开启
+    4. 运行与评测
 
-        做了什么：理解 sstatus.SIE 的保存与恢复，以及 local_intr_save/local_intr_restore 在物理内存管理等临界区中的作用。
-
-        为什么最后实现这个：中断机制完整可用之后，才能在需要原子性的关键操作中安全地屏蔽和恢复中断。
+        做了什么：在模块三完成后运行 make qemu，观察内核启动、initproc 创建以及时钟中断输出；运行课程提供的测试（make grade），验证物理内存管理、进程创建和调度相关测试；保存运行与评分截图作为实验验证材料。
 
 ---
 
@@ -100,432 +106,295 @@
 每个功能模块或者练习中可能包含多项任务，请根据实际情况调整
 -->
 
-### 功能模块一：[Trap 入口与上下文保存/恢复]
+### 前置工作：补齐 Lab2 / Lab3 代码
 
 **负责人：** [2412806-阳雨洁]
 
 #### 模块功能描述
 
-**需要实现/修改的函数/宏：**
+Lab4 的工程骨架中保留了 `//lab2`、`//lab3` 标记，需要把前序实验已经完成的内容回填，保证 Lab4 能在 Lab2/Lab3 的可用状态上继续推进。
 
-```asm
+**需要补回的内容：**
+
+```c
+// kern/mm/pmm.c
+static void page_init(void);
+
+// kern/mm/default_pmm.c
+// Best-Fit 分配器的 init / init_memmap / alloc_pages / free_pages / nr_free_pages
+// 以及 default_pmm_manager 注册
+
+// kern/trap/trap.c
+void interrupt_handler(struct trapframe *tf);
+void exception_handler(struct trapframe *tf);
+static inline void trap_dispatch(struct trapframe *tf);
+
+// kern/trap/trapentry.S
 .macro RESTORE_ALL
 __alltraps
 ```
 
 **功能说明：**
 
-本模块负责 Trap 入口处的上下文切换，是中断处理机制能够“进得来、回得去”的基础。框架已经提供 SAVE_ALL 与 `__trapret` 的骨架，需要补全的是 RESTORE_ALL 以及 `__alltraps` 中调用 C 处理函数的衔接代码。
+- `page_init()`：从 DTB 读取物理内存范围，建立 `pages` 描述符数组，把内核镜像、OpenSBI 和描述符数组自身标记为 Reserved，再把剩余空闲页通过 `init_memmap()` 注册给 PMM。
+- Best-Fit 分配器：空闲块按物理地址有序组织；分配时扫描所有块，选择满足 `property >= n` 的最小空闲块；释放时按地址插入并合并前后相邻空闲块。
+- `interrupt_handler()` / `exception_handler()`：分别处理时钟中断、软件中断、断点异常、非法指令异常，并保证未知中断/异常走可返回的打印兜底路径。
+- `RESTORE_ALL` / `__alltraps`：按 `SAVE_ALL` 的实际布局恢复通用寄存器与 CSR，并在 Trap 入口把 trapframe 地址放入 `a0` 后调用 `trap()`。
+
+**补充说明：**
+
+- `default_pmm.c` 原有的 `basic_check()` 与 `best_fit_check()` 属于框架测试代码，未作修改。
+- `default_pmm.c` 中包含 `<best_fit_pmm.h>`，而 Lab4 工程原本缺少该头文件，因此按 Lab3 内容补入了 `kern/mm/best_fit_pmm.h`。
+- Lab4 的 `default_pmm_manager` 使用 Best-Fit 语义，`check` 指向已有的 `best_fit_check()`。
+
+#### 实现结果
+
+- `pmm.c`、`default_pmm.c`、`trap.c`、`trapentry.S` 均使用 Lab4 Makefile 的参数单独编译通过。
+- 该部分完成后，Lab4 具备了物理内存管理、页表自检和 Trap 处理的基础，可以继续实现 Lab4 的页表映射与进程管理。
+
+---
+
+### 功能模块一：[页表映射的建立与撤销]
+
+**负责人：** [2412806-阳雨洁]
+
+#### 模块功能描述
+
+**需要实现/修改的函数：**
+
+```c
+static inline void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep);
+void page_remove(pde_t *pgdir, uintptr_t la);
+int  page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm);
+```
+
+**功能说明：**
+
+本模块负责在现有多级页表框架上建立、更新和撤销“线性地址 → 物理页”的映射，是虚拟内存管理与进程地址空间能够工作的基础。
 
     该模块在整个系统中的作用：
 
-        保存现场：Trap 发生时硬件跳转到 stvec 指向的 __alltraps，SAVE_ALL 把被打断程序的所有通用寄存器（x0–x31）、sstatus、sepc、badvaddr（stval）、scause 保存到当前内核栈上，形成一个 struct trapframe。
+        定位页表项：page_insert/page_remove 都必须通过 get_pte() 定位 la 对应的 PTE；page_insert 使用 create=1，必要时分配中间级页表页；page_remove 使用 create=0，不分配新页表。
 
-        交给 C 处理：__alltraps 需要按 RISC-V 调用约定把 Trap frame 首地址放入 a0，调用 void trap(struct trapframe *tf)，由 trap.c 完成具体的中断/异常分发与处理。
+        建立/更新映射：page_insert 成功定位 PTE 后，对新物理页 page_ref_inc()，再把 PTE 写为 pte_create(page2ppn(page), PTE_V | perm)，从而同时设置物理页号、有效位和调用者要求的权限位。
 
-        恢复现场：trap() 返回后进入 __trapret，RESTORE_ALL 按与 SAVE_ALL 一一对应的关系恢复寄存器和 CSR，最后执行 sret，回到被打断的执行流。
+        撤销映射：page_remove 在 PTE 有效时取出对应物理页，清空 PTE，调用 page_ref_dec()；引用计数降为 0 时 free_page() 释放物理页，并执行 tlb_invalidate()。
 
     需要特别处理的场景：
 
-        x2(sp) 的特殊性：SAVE_ALL 先执行 csrw sscratch, sp 暂存原 sp，再下移内核栈；随后通过 csrrw s0, sscratch, x0 把原 sp 取出并存入 Trap frame 的 2*REGBYTES 槽。因此 RESTORE_ALL 不能把 sp 当作普通寄存器提前恢复，必须在其他寄存器都恢复完之后最后恢复 x2，否则会丢失 Trap frame 基址。
+        原地址已映射同一物理页：page_insert 先 page_ref_inc() 再 page_ref_dec()，净效果为 0，只更新权限位，避免同一页被重复计数。
 
-        sret 的前置状态：sstatus 与 sepc 必须在执行 sret 前恢复，否则返回地址或中断使能状态错误；恢复顺序上先写 CSR，再恢复通用寄存器，最后恢复 sp。
+        原地址已映射其他物理页：先对新页 page_ref_inc()，再通过 page_remove_pte() 撤销旧映射（递减旧页引用、必要时释放、清 PTE、失效 TLB），最后写入新 PTE。
 
-        x0 的处理：x0 恒为 0，SAVE_ALL 虽然保存了它，但 RESTORE_ALL 不能也不需要恢复 x0（写 x0 无效果）。
+        中间级页表分配失败：get_pte(..., 1) 返回 NULL 时直接返回 -E_NO_MEM，此时尚未修改引用计数或页表，不会留下半完成映射。
 
-        调用约定：trap() 的第一个参数通过 a0 传递；__alltraps 在 jal trap 前执行 move a0, sp；trap() 返回后 sp 应保持不变，直接落入 __trapret。
+        幂等删除：page_remove 对 get_pte(..., 0) 的 NULL 结果、以及 *ptep 无效的情况都会安静返回；重复调用不会重复递减引用计数。
+
+        TLB 一致性：任何 PTE 写入（新建、更新、清空）之后，都对 la 执行 tlb_invalidate()，避免硬件继续使用旧翻译。
 
     与其他模块的交互关系：
 
-        上游：idt_init() 将 stvec 设置为 __alltraps 的地址，Trap 发生时硬件据此跳转。
+        上游：get_pte() 负责 Sv39 三级页表遍历与中间级页表分配；pte2page() 把 PTE 还原为 struct Page；page_ref_inc()/page_ref_dec() 维护引用计数。
 
-        下游：通过 a0 把 struct trapframe * 交给 trap.c 的 trap()，由 trap_dispatch()、interrupt_handler()、exception_handler() 处理；处理结果直接写回 Trap frame，由本模块恢复。
+        下游：check_pgdir()、check_boot_pgdir() 和 test_lab4_pmm_basic() 通过 page_insert/page_remove 验证映射、引用计数和权限位的正确性。
 
-        数据布局：严格依赖 struct trapframe（gpr[32] + status + epc + badvaddr + cause，共 36*REGBYTES）与 SAVE_ALL 中实际的偏移，不得臆造顺序。
+        与进程的关系：进程的 pgdir（页目录物理地址）最终由这些映射接口维护；本实验创建的是内核线程，暂时共享内核页表。
+
 
 #### 最终提示词
 
-以下是经过迭代优化后，最终成功实现该功能的提示词：
+完整提示词见 `report/prompt.md` 的「功能模块一」，核心任务如下：
 
 ````markdown
-
 [PROMPT]
-**任务**：修改文件 `kern/trap/trapentry.S`，实现或完善 `RESTORE_ALL` 与 `__alltraps`。`RESTORE_ALL` 负责根据已有 `SAVE_ALL` 建立的 Trap frame 恢复被打断程序的处理器上下文；`__alltraps` 负责在 Trap 入口完成上下文保存后，按照 RISC-V 调用约定把当前 Trap frame 地址作为 `struct trapframe *` 参数传递给 C 语言函数 `void trap(struct trapframe *tf)`，并在 `trap()` 返回后进入 `__trapret`，最终通过 `sret` 返回原执行流。
+**任务**：修改文件 `kern/mm/pmm.c`，实现 `page_insert` 与 `page_remove` 两个函数。`page_insert` 负责在现有多级页表框架上建立或更新“线性地址 → 物理页”的映射，并同步维护物理页引用计数、页表项权限位与 TLB 状态；`page_remove` 负责安全撤销已建立的映射，作为幂等删除接口，同时正确递减引用计数并失效 TLB。
 
-**操作要求**：你必须在项目中修改实际文件 `kern/trap/trapentry.S`，保留文件中的现有代码，只在你需要补全或完善的 `RESTORE_ALL`、`__alltraps` 及其附近位置进行修改和补充。不要删除既有逻辑，不要修改无关文件，不要修改 `pmm.c`。必须先阅读并严格依据文件中已有的 `SAVE_ALL`、`struct trapframe` 定义、`__trapret` 以及 `trap()` 的函数签名进行实现；不得自行假设与实际 Trap frame 不一致的寄存器保存顺序、偏移或数据布局。不得修改 `SAVE_ALL`、`struct trapframe` 和 `trap()` 的函数签名。实现方式不限定为某一种固定汇编指令序列，但必须保证“Trap 进入 -> 上下文保存 -> C 语言处理 -> 上下文恢复 -> Trap 返回”闭环一致。
+**操作要求**：你必须在项目中修改实际文件 `kern/mm/pmm.c`，保留文件中的现有代码，只在 `page_insert`、`page_remove` 及其附近位置进行修改和补充。不要删除既有逻辑，不要修改无关文件，不要修改 `trapentry.S`、`swap.c` 等无关模块。必须先阅读并严格依据工程中已有的 `get_pte`、`pte_create`、`pte2page`、`page_ref_inc`、`page_ref_dec`、`set_page_ref`、`alloc_page`、`free_page`、`tlb_invalidate`、`flush_tlb`、`struct Page`、`struct Page *pages`、`boot_pgdir_va`、`PDE/PTE` 类型定义以及 `PTE_V/PTE_U/PTE_W/PTE_R` 等宏进行实现；不得自行假设与实际页表布局、权限位或引用计数语义不一致的行为。不得修改上述已有接口的签名、语义和 `struct Page` 的定义。实现方式不限定为某一种固定代码序列，但必须保证“定位页表项 → 建立/更新或删除映射 → 维护引用计数 → 失效 TLB → 返回状态”的闭环一致。
 
 **输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 部分提供的信息，以工程真实代码为准，不要引入无关功能。
-
-[RELY]
-
-// 1. 相关文件与已有汇编接口
-
-`kern/trap/trapentry.S` 中已提供或需要完善的汇编符号/宏包括：
-
-SAVE_ALL      // 已提供：把 Trap 发生时的处理器状态保存到当前内核栈上的 Trap frame 中
-__alltraps    // 需要完善：Trap 汇编入口，建立 Trap frame 并调用 trap(struct trapframe *tf)
-__trapret     // 已提供：Trap 返回路径，最终执行 sret
-RESTORE_ALL   // 需要实现/完善：从当前 Trap frame 恢复处理器上下文
-
-// 2. C 语言接口与数据结构
-
-struct trapframe;                  // 决定 SAVE_ALL 保存后的上下文数据布局
-void trap(struct trapframe *tf);   // C 语言 Trap 处理函数，不得修改函数签名
-
-// 3. RISC-V 体系结构与调用约定
-
-- RISC-V 函数调用约定：第一个整型/指针参数通过 a0 传递。
-- `__alltraps` 调用 `trap()` 前，必须把当前 Trap frame 的首地址按调用约定放入 a0。
-- `trap()` 返回后，应进入 `__trapret`，由 `__trapret` 继续完成返回流程并执行 `sret`。
-- Trap frame 的实际布局由 `struct trapframe` 和已有 `SAVE_ALL` 决定，不得臆造。
-- 特别注意：`SAVE_ALL` 中对 x2(sp) 的处理方式与其他通用寄存器并不完全相同；`RESTORE_ALL` 不能简单地把所有寄存器按完全相同方式恢复，必须先以当前 Trap frame 基址完成其他必要恢复，最后安全恢复被打断程序的 sp，或采用与现有 SAVE_ALL 布局等价的正确方式。
-- `RESTORE_ALL` 必须与 `SAVE_ALL` 的保存关系一一对应，不能破坏 `__trapret` 执行 `sret` 所需的返回状态。
-
-[GUARANTEE]
-
-必须实现或完善以下接口：
-
-```asm
-__alltraps
-RESTORE_ALL
-```
-
-可以添加：
-- 内部使用的汇编标签
-- 必要的注释
-- 与现有 `SAVE_ALL` 布局一致的内部宏或辅助代码片段
-
-但不得：
-- 修改 `SAVE_ALL`
-- 修改 `struct trapframe`
-- 修改 `void trap(struct trapframe *tf)` 的函数签名
-- 修改 `__trapret` 既有的 `sret` 返回机制
-- 引入与 Trap 上下文保存/恢复无关的功能
-
-[SPECIFICATION]
-
-## __alltraps
-**Pre-Condition**：
-- `SAVE_ALL` 已按现有 Trap frame 布局把 Trap 发生时的处理器状态保存到当前内核栈。
-- 当前栈指针指向该 Trap frame。
-- `trap(struct trapframe *tf)` 可被调用。
-- `__trapret` 已存在，并负责最终 Trap 返回。
-
-**Post-Condition**：
-- `__alltraps` 在完成必要的 Trap 入口处理后，将当前 Trap frame 首地址按照 RISC-V 调用约定放入 `a0`。
-- 调用 `trap(struct trapframe *tf)`。
-- `trap()` 返回后，跳转进入 `__trapret`。
-- 调用 `trap()` 过程中不得破坏后续 `RESTORE_ALL`/`__trapret` 恢复上下文所需的信息。
-
-**Case 1**：正常 Trap 入口调用
-- 触发条件：已存在有效 Trap frame，`trap()` 可调用。
-- 执行行为：正确建立 `a0 = 当前 Trap frame 地址`，调用 `trap()`；返回后进入 `__trapret`。
-
-**Case 2**：不得臆造 Trap frame 布局
-- 触发条件：`SAVE_ALL` 或 `struct trapframe` 已有实际布局。
-- 执行行为：必须以文件中真实保存顺序和偏移为准，不得按固定伪代码假设布局。
-
-## RESTORE_ALL
-**Pre-Condition**：
-- 当前 `sp` 指向 `SAVE_ALL` 建立的 Trap frame。
-- Trap frame 中各寄存器保存位置由已有 `SAVE_ALL` 和 `struct trapframe` 决定。
-
-**Post-Condition**：
-- 按与 `SAVE_ALL` 对应的关系恢复 Trap frame 中保存的处理器上下文。
-- 对 x2(sp) 进行特殊处理：不得在仍需要 Trap frame 基址时把 sp 当普通寄存器提前恢复；应保证最终恢复到被打断程序的 sp，或采用与现有布局等价的正确方式。
-- 不破坏 `__trapret` 执行 `sret` 所需的状态。
-- 恢复完成后，控制流可进入 `__trapret` 并最终通过 `sret` 返回原执行流。
-
-**Case 1**：正常上下文恢复
-- 触发条件：Trap frame 布局与 `SAVE_ALL` 一致。
-- 执行行为：正确恢复已保存寄存器；x2(sp) 按特殊方式安全恢复；不得破坏返回路径。
-
-**Case 2**：布局依赖不明确
-- 触发条件：无法从现有 `SAVE_ALL`、`struct trapframe` 或文件骨架确定某一偏移/顺序。
-- 执行行为：不得猜测硬编码；应以工程真实代码为准补全，并通过注释明确依赖关系；不得引入无关功能。
-
-**Case 3**：不得修改既有接口
-- 触发条件：实现 `RESTORE_ALL` 和 `__alltraps` 时涉及 `SAVE_ALL`、`struct trapframe`、`trap()` 或 `__trapret`。
-- 执行行为：保持 `SAVE_ALL`、`struct trapframe`、`trap()` 签名和 `__trapret` 既有返回机制不变，只补全本模块要求的上下文恢复与 Trap 入口调用关系。
-
 ````
 
 #### 实现迭代过程
 
-本模块的实现经历了 [1] 次迭代，过程如下：
+本模块的实现经历了 [1] 次编码迭代，过程如下：
 
 ---
 
 ##### 第一次迭代
 
-由于 [SPECIFICATION] 已明确要求“以工程真实代码为准”，实现前先阅读了 `SAVE_ALL`、`struct trapframe`（`kern/trap/trap.h`）、`trap()`（`kern/trap/trap.c`）与 `__trapret`，确认了 Trap frame 的实际布局：x0–x31 依次位于 `0*REGBYTES`–`31*REGBYTES`，其中 x2 槽保存的是被打断程序的原始 sp（SAVE_ALL 通过 `sscratch` 中转）；`status`、`epc`、`badvaddr`、`cause` 位于 `32*REGBYTES`–`35*REGBYTES`。
+实现前先阅读了 `kern/mm/pmm.c`、`kern/mm/pmm.h`、`kern/mm/mmu.h` 和 `kern/mm/memlayout.h`，确认了以下事实：
+
+- `get_pte(pgdir, la, create)` 已经完成 Sv39 三级页表遍历；`create=1` 时会调用 `alloc_page()` 分配中间级页表，并可能返回 `NULL`。
+- `pte_create(ppn, type)` 的参数是 PPN，并且内部已经执行 `(ppn << PTE_PPN_SHIFT) | PTE_V | type`。
+- `page_ref_dec(page)` 只返回递减后的引用计数，不会自动释放物理页。
+- `free_page(page)` 是 `free_pages(page, 1)` 的宏。
+- `tlb_invalidate(pgdir, la)` 使用 `sfence.vma` 失效单个地址的 TLB。
 
 据此实现：
 
-- `RESTORE_ALL`：先从 `32*REGBYTES`、`33*REGBYTES` 恢复 sstatus 与 sepc（`csrw`），再按 SAVE_ALL 的对应关系恢复 x1、x3–x31，最后单独 `LOAD x2, 2*REGBYTES(sp)`。
-- `__alltraps`：`SAVE_ALL` 之后执行 `move a0, sp`、`jal trap`，返回后自然落入 `__trapret`，由 `RESTORE_ALL` 与 `sret` 完成返回。
+- `page_remove_pte()`：PTE 有效时取得物理页，`page_ref_dec()`；计数为 0 时 `free_page()`；清空 `*ptep`；执行 `tlb_invalidate()`。
+- `page_remove()`：`get_pte(..., 0)` 判空后调用 `page_remove_pte()`，因此中间级页表不存在、PTE 无效或重复删除都安全返回。
+- `page_insert()`：先 `get_pte(..., 1)`，失败返回 `-E_NO_MEM`；`page_ref_inc()` 后检查旧 PTE：同一页则 `page_ref_dec()` 抵消，不同页则调用 `page_remove_pte()` 撤销旧映射；最后写入新 PTE 并 `tlb_invalidate()`。
 
 **遇到的问题：**
 
-- 问题一：最初考虑按 x0–x31 的直觉顺序统一恢复。但 `sp` 本身用于访问 Trap frame，若在恢复过程中提前改写 sp，后续所有 `LOAD` 的基址都会失效。
-- 原因分析：SAVE_ALL 把原始 sp 存放在 x2 槽，而不是在恢复时继续复用；因此恢复 sp 必须是最后一步。
-
-- 问题二：本机工具链（GCC 15 / binutils）不再识别 `SAVE_ALL` 中使用的旧 CSR 名称 `sbadaddr`，直接 `make` 会在该行报 `unknown CSR 'sbadaddr'`。
-- 原因分析：`sbadaddr` 是旧版 privileged ISA 中 `stval` 的别名，对应同一个 CSR（0x143），新版汇编器只接受 `stval`。这是框架既有代码与工具链版本之间的兼容问题，并非本模块实现错误；同时任务约束明确禁止修改 `SAVE_ALL`。
+- 问题一：把 `pte_create` 描述为接收物理地址 `pa` 和 `perm`，与工程真实接口不一致。
+- 原因分析：工程中的 `pte_create` 接收的是 PPN，并且已经包含 `PTE_V`；如果按提示词直接传 `page2pa(page)`，会导致页号被重复左移。
+- 问题二：认为 `page_ref_dec` 可能触发释放，但工程实现只递减计数。
+- 原因分析：引用计数接口与释放策略是分离的；需要在本模块内判断计数是否归零并调用 `free_page()`。
 
 **问题解决策略：**
 
-- 针对问题一：将 `LOAD x2, 2*REGBYTES(sp)` 放在所有通用寄存器和 CSR 恢复之后，并在代码中用注释说明原因。
-- 针对问题二：不修改工程中的 `SAVE_ALL`；为验证本模块的语法与最终指令序列，将文件复制到临时目录，仅把 `sbadaddr` 替换为等价的 `stval` 后用 Makefile 的原始编译参数汇编，并检查反汇编结果。
+- 针对问题一：以工程真实代码为准，使用 `pte_create(page2ppn(page), PTE_V | perm)`。
+- 针对问题二：在 `page_remove_pte()` 中显式判断 `page_ref_dec(page) == 0`，再调用 `free_page(page)`。
+- 针对同一页重复映射：先 `page_ref_inc()` 再 `page_ref_dec()`，保证净引用计数不变，同时统一走“写 PTE + 失效 TLB”的路径。
 
 **最终结果：**
 
-经过 [1] 次迭代，该模块最终：
-- 汇编验证通过（临时副本中 `sbadaddr`→`stval` 等价替换；`RESTORE_ALL`、`__alltraps` 语法正确）
-- 反汇编确认 `__alltraps` 先 `mv a0, sp` 再 `jal trap`；`__trapret` 依次恢复 sstatus/sepc、各通用寄存器，最后 `ld sp,16(sp)` 并 `sret`
-
-
+- `kern/mm/pmm.c` 使用 Lab4 Makefile 的编译参数单独编译通过。
+- 完成本模块后，完整链接中 `page_insert`、`page_remove` 的未定义符号全部消失。
+- 从接口行为上满足 `check_pgdir()`、`check_boot_pgdir()` 与 `test_lab4_pmm_basic()` 对映射、引用计数、权限位和 TLB 一致性的要求。
 
 **关键改进点总结：**
-1. [严格以 SAVE_ALL 的实际布局为准：所有偏移、寄存器顺序均与文件中真实的保存顺序一一对应，没有按伪代码臆造布局。]
-2. [sp 特殊处理：明确 x2 槽保存的是原始 sp，恢复必须放在最后，避免提前破坏 Trap frame 基址。]
-3. [接口零改动：SAVE_ALL、struct trapframe、trap() 签名与 __trapret 机制均未修改，只补全上下文恢复与入口调用关系。]
-4. [可验证性：在不能改动 SAVE_ALL 的前提下，用临时副本完成汇编与反汇编验证，确认指令序列符合预期。]
 
-### 功能模块二：[中断分发与中断处理]
+1. [以工程真实接口为准：`pte_create` 传 PPN 并依赖其内置的 `PTE_V`，没有按提示词的伪接口臆造。]
+2. [引用计数与释放分离：`page_ref_dec` 只递减，计数为 0 时由本模块显式 `free_page`。]
+3. [同一物理页重复映射时净计数为 0，只更新权限位。]
+4. [所有 PTE 写入后统一 `tlb_invalidate`，保证 TLB 与页表一致。]
+5. [`page_remove` 对不存在/无效映射安静返回，保证幂等性。]
+
+---
+
+### 功能模块二：[内核线程创建与登记]
+
+**负责人：** [2412806-阳雨洁]
+
+#### 模块功能描述
+
+**需要实现/修改的函数：**
+
+```c
+static struct proc_struct *alloc_proc(void);
+void proc_init(void);
+int  kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags);
+int  do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf);
+static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf);
+static int  copy_mm(uint32_t clone_flags, struct proc_struct *proc);
+```
+
+**功能说明：**
+
+本模块负责把系统从“已经能运行内核代码”推进到“已经能创建并登记多个内核线程”，是调度的前提。
+
+- `alloc_proc()`：通过 `kmalloc` 分配 `proc_struct`，整体清零后设置 `state = PROC_UNINIT`、`pid = -1`、`kstack = 0`、`need_resched = 0`、`parent = NULL`、`mm = NULL`、`tf = NULL`、`pgdir = boot_pgdir_pa`、`flags = 0`，并保证 `context`、`name`、`list_link/hash_link` 处于安全空白状态。
+- `proc_init()`：初始化 `proc_list` 与 `hash_list`；创建 `idleproc`（`pid = 0`、`PROC_RUNNABLE`、`kstack = bootstack`、`need_resched = 1`、`pgdir = boot_pgdir_pa`），挂入链表/哈希表，`nr_process++`，置 `current = idleproc`；随后通过 `kernel_thread(init_main, NULL, 0)` 创建 `initproc`，并用 `find_proc()` 取回指针、命名 `"init"`。
+- `kernel_thread()`：构造局部 `trapframe` 模板：`epc = kernel_thread_entry`、`s0 = fn`、`s1 = arg`、`a0 = 0`；`status` 从 `sstatus` 读取后置 `SSTATUS_SPP | SSTATUS_SPIE`、清 `SSTATUS_SIE`；调用 `do_fork(clone_flags, 0, &tf)` 并返回 PID。
+- `do_fork()`：按“分配 PCB → 设置 parent → 分配内核栈 → copy_mm → copy_thread → 分配 PID 并挂入 proc_list/hash_list → wakeup_proc”的顺序创建线程；前 3 步失败时按逆序释放资源，不挂链表、不递增 `nr_process`。
+- `copy_thread()`：在 `proc->kstack + KSTACKSIZE` 顶部放置 `trapframe`，复制模板（`tf == NULL` 时清零）；`a0 = 0`；`gpr.sp = (esp == 0) ? proc->tf : esp`；`context.ra = forkret`，`context.sp = proc->tf`。
+- `copy_mm()`：本实验为内核线程，`proc->mm = NULL`，成功返回 0，保留后续扩展接口。
+
+**首次运行链路：**
+
+```text
+schedule() / proc_run() 、
+    -> switch_to(&prev->context, &next->context)
+    -> next->context.ra == forkret
+    -> forkret() -> forkrets(current->tf)
+    -> __trapret -> RESTORE_ALL -> sret
+    -> kernel_thread_entry: move a0, s1; jalr s0
+    -> fn(arg)
+```
+
+**idleproc / initproc / current 的关系：**
+
+- `idleproc` 不是普通 fork 产物，而是把 `kern_init` 以来的当前执行现场包装成第 0 个内核线程；其 `kstack` 直接复用启动栈 `bootstack`。
+- `initproc` 通过 `kernel_thread(init_main, NULL, 0)` 创建，走完整的 `kernel_thread → do_fork → copy_thread` 路径，`parent` 为 `idleproc`。
+- `current` 在 `proc_init()` 中指向 `idleproc`，之后由调度器在切换到新线程时更新。
+
+#### 最终提示词
+
+完整提示词见 `report/prompt.md` 的「功能模块二」，核心任务如下：
+
+````markdown
+[PROMPT]
+**任务**：修改文件 `kern/process/proc.c`，实现 `alloc_proc`、`proc_init`、`kernel_thread`、`do_fork`、`copy_thread`、`copy_mm` 六个函数。本模块负责把系统从“已经能运行内核代码”推进到“已经能创建并登记多个内核线程”：`alloc_proc` 得到一个干净的进程控制块；`proc_init` 把当前执行现场包装成 `idleproc` 并创建第一个真正的内核线程 `initproc`；`kernel_thread` 把函数入口和参数整理成线程首次运行所需的临时上下文；`do_fork` 把上下文、内核栈、PID、链表、状态位等资源组合成一个可运行实体；`copy_thread` 把 trapframe 和 context 安放到新线程自己的内核栈上；`copy_mm` 在当前实验阶段承担地址空间处理接口的占位作用。
+
+**操作要求**：你必须在项目中修改实际文件 `kern/process/proc.c`，保留文件中的现有代码，只在上述函数及其附近位置进行修改和补充。不要删除既有逻辑，不要修改无关文件，不得修改 `switch.S`、`trapentry.S`、`trap.c`、`pmm.c` 等无关模块。必须先阅读并严格依据工程中已有的 `struct proc_struct`、`struct context`、`struct trapframe`、`list_entry_t`、`proc_list`、`hash_list`、`idleproc`、`initproc`、`current`、`nr_process`、`bootstack`、`boot_pgdir_pa`、`kernel_thread_entry`、`forkret`、`forkrets`、`SSTATUS_SPP/SPIE/SIE` 等实际定义与符号进行实现；不得自行假设与实际结构布局、字段偏移、上下文保存顺序或符号名不一致的行为。
+
+**输出要求**：直接进行文件操作，使用 [RELY]、[GUARANTEE]、[SPECIFICATION] 部分提供的信息，以工程真实代码为准，不要引入无关功能。
+````
+
+#### 实现迭代过程
+
+本模块的实现经历了 [1] 次编码迭代，过程如下：
+
+---
+
+##### 第一次迭代
+
+实现前先阅读了 `kern/process/proc.c`、`kern/process/proc.h`、`kern/trap/trap.h`、`kern/process/entry.S`、`kern/process/switch.S`、`kern/trap/trapentry.S`、`kern/mm/pmm.h` 与 `kern/sync/sync.h`，确认了以下事实：
+
+- `struct proc_struct` 的字段顺序为 `state/pid/runs/kstack/need_resched/parent/mm/context/tf/pgdir/flags/name/list_link/hash_link`。
+- `struct context` 只保存 `ra/sp/s0~s11` 共 14 个 callee-saved 寄存器。
+- `kernel_thread_entry` 位于 `kern/process/entry.S`：`move a0, s1; jalr s0; jal do_exit`。
+- `forkret` 调用 `forkrets(current->tf)`；`forkrets` 位于 `trapentry.S`，执行 `move sp, a0; j __trapret`。
+- `boot_pgdir_pa` 的实际类型是 `uintptr_t`，不是提示词中的 `pde_t *`。
+- `alloc_page()` 是无参数宏；`setup_kstack()`/`put_kstack()` 已在文件中提供。
+- `local_intr_save/local_intr_restore` 可用于保护 PID 分配与链表挂接。
+
+据此实现：
+
+- `alloc_proc()`：`kmalloc` + `memset` + 逐字段初始化；失败返回 `NULL`。
+- `copy_mm()`：内核线程场景下 `proc->mm = NULL`，返回 0。
+- `copy_thread()`：在 `proc->kstack + KSTACKSIZE` 顶部放置 trapframe；复制模板或清零；`a0 = 0`；`gpr.sp` 对内核线程设为 trapframe 地址；`context.ra = forkret`、`context.sp = proc->tf`。
+- `do_fork()`：7 步创建流程；`alloc_proc`/`setup_kstack`/`copy_mm` 失败时跳转到对应清理标签；PID 分配、`hash_proc`、`list_add`、`nr_process++` 放在关中断临界区；最后 `wakeup_proc()`。
+- `kernel_thread()`：构造 trapframe 模板并调用 `do_fork(clone_flags, 0, &tf)`。
+- `proc_init()`：初始化 `proc_list`/`hash_list`；创建并登记 `idleproc`，置 `current`；通过 `kernel_thread(init_main, ...)` 创建 `initproc`，`find_proc` 取回并命名。
+
+**遇到的问题：**
+
+- 问题一：把 `boot_pgdir_pa` 写成 `pde_t *`，实际工程中是 `uintptr_t`。
+- 原因分析：`proc->pgdir` 也是 `uintptr_t`，直接赋 `boot_pgdir_pa` 即可，不能按指针类型处理。
+- 问题二：`copy_thread` 的 `tf` 参数可能为 `NULL`，直接解引用会崩溃。
+
+
+**问题解决策略：**
+
+- 针对问题一：以工程真实类型为准，`proc->pgdir = boot_pgdir_pa`。
+- 针对问题二：在 `copy_thread` 中先判断 `tf != NULL`，否则 memset 整个 trapframe，再设置 `a0/sp/context`。
+
+
+**最终结果：**
+
+- `kern/process/proc.c` 使用 Lab4 Makefile 的编译参数单独编译通过。
+- 完成本模块后，完整链接中 `proc_init` 的未定义符号消失。
+- 静态核对 `test_lab4_process_create()` 的断言：`idleproc` 的 `pid/state/kstack/parent/mm/tf/runs/flags/context.ra` 与 `initproc` 的 `pid/state/parent/mm/context.ra/sp` 均已满足。
+
+**关键改进点总结：**
+
+1. [以工程真实结构为准：`boot_pgdir_pa` 是 `uintptr_t`，trapframe/context 字段偏移严格按实际定义。]
+2. [首次运行链路完整：`context.ra = forkret`、`context.sp = tf`、`gpr.sp = tf`，与 `forkrets/__trapret/kernel_thread_entry` 配合。]
+3. [资源清理干净：`do_fork` 前 3 步失败时逆序释放内核栈与 PCB，不挂链表、不递增计数。]
+4. [`copy_thread` 对 `tf == NULL` 做了保护，避免空指针。]
+5. [按实验要求登记 idleproc，并记录其与经典 ucore 调度实现的差异。]
+
+---
+
+### 功能模块三：[进程调度与上下文切换]（待完成）
 
 **负责人：** [2410796-艾思奇]
 
 #### 模块功能描述
 
-**需要实现/修改的函数/宏：**
-
-```c
-void interrupt_handler(struct trapframe *tf);
-void exception_handler(struct trapframe *tf);
-```
-
-**功能说明：**
-
-本模块负责处理经过 Trap 入口保存并传递到 C 语言的 Trap 上下文，是中断处理机制中“进来之后做什么”的部分。已有的 `trap_dispatch()` 根据 `scause` 最高位完成中断与异常的第一级分类：最高位为 1 时调用 `interrupt_handler()`，最高位为 0 时调用 `exception_handler()`。两个处理函数都接收当前 `struct trapframe *`，并在完成处理后返回到统一路径，由 `__trapret`、`RESTORE_ALL` 和 `sret` 恢复被打断的执行流。
-
-`interrupt_handler()` 负责处理异步中断。对于 S 模式时钟中断，函数先屏蔽 `tf->cause` 的最高位得到实际中断原因，再增加全局 `ticks`，通过 `clock_set_next_event()` 设置下一次时钟事件，并在每累计 `TICK_NUM == 100` 次 tick 时调用已有的 `print_ticks()`。时钟事件必须持续重装，否则系统只会收到一次时钟中断。对于 S 模式软件中断，输出规定提示；对于无法识别的中断，输出原因号并调用 `print_trapframe(tf)` 保存完整现场用于调试。
-
-`exception_handler()` 负责处理同步异常。断点和非法指令异常都会输出异常地址，并根据故障指令的最低两位判断其是 2 字节压缩指令还是 4 字节标准指令，再相应推进 `tf->epc`。由于 `RESTORE_ALL` 会从 Trap frame 中恢复 `sepc`，处理函数必须修改 `tf->epc` 而不是直接写 `sepc`。其他未要求具体处理的异常则通过 `print_trapframe(tf)` 输出现场后返回，避免在兜底路径中阻塞统一的 Trap 返回流程。
-
-本模块与模块一共同构成完整闭环：
-
-    时钟中断或异常发生
-        -> __alltraps 保存 Trap frame
-        -> trap(tf)
-        -> trap_dispatch(tf) 分类
-        -> interrupt_handler(tf) 或 exception_handler(tf)
-        -> trap() 返回
-        -> __trapret、RESTORE_ALL
-        -> sret 返回被打断的执行流
-
-实现过程中特别以当前工程实际代码和评分脚本为准。指导书正文提到了 `SHUTDOWN_AFTER` 与系统关机逻辑，但当前工程没有定义 `SHUTDOWN_AFTER`，评分测试也要求时钟中断持续处理到 `ticks=200`，因此本模块没有引入关机分支，避免使用未定义标识符或提前终止内核。
+（待补充：`schedule()`、`proc_run()`、`switch_to()`、`cpu_idle()` 等函数的实现思路，以及与 `proc_list`、`need_resched`、Round-Robin 调度的关系。）
 
 #### 最终提示词
 
-以下是用于实现本模块的最终提示词：
-
-````markdown
-[PROMPT]
-**任务**：在工作区的 `Nk_Os_Lab/code` 项目中修改文件 `kern/trap/trap.c`，实现中断与异常处理功能模块中的 `interrupt_handler(struct trapframe *tf)` 和 `exception_handler(struct trapframe *tf)` 两个函数。这两个函数由现有的 `trap_dispatch()` 调用，分别负责处理 RISC-V Trap 中的中断和同步异常。
-
-**操作要求**：你必须在项目中修改实际文件，而不是仅展示代码。只修改 `kern/trap/trap.c`，将实现插入到 `//lab3 function2 YOUR CODE` 标记附近，并确保两个函数的定义位于 `trap_dispatch()` 调用它们之前，避免隐式函数声明。保留文件中已有的 `print_ticks()`、`idt_init()`、`print_trapframe()`、`print_regs()`、`trap_dispatch()` 和 `trap()` 等既有代码及其行为，不要删除或重写无关逻辑，不要修改 `trapentry.S`、`trap.h`、`clock.c`、`init.c` 或测试与评分脚本。允许添加仅在本文件内部使用的 `static` 辅助函数。
-
-**输出要求**：直接进行文件操作。严格使用下面 `[RELY]` 中与当前工程一致的真实宏、数据结构和函数；不要引入未定义的标识符，不要引入与当前 Lab3 无关的系统调用、调度或关机功能。实现后应能通过编译，并使时钟中断、软件中断回退、未知中断回退、断点异常、非法指令异常和未知异常回退能够正确返回到统一的 Trap 返回流程。
-
-[RELY]
-
-// 宏定义
-```c
-#define TICK_NUM 100
-
-#define IRQ_S_SOFT   1
-#define IRQ_S_TIMER  5
-
-#define CAUSE_ILLEGAL_INSTRUCTION 0x2
-#define CAUSE_BREAKPOINT          0x3
-```
-
-RISC-V 的 `scause` 最高位为 1 表示该 Trap 是中断，低 63 位表示中断原因；最高位为 0 表示同步异常。`trap_dispatch()` 已使用 `(intptr_t)tf->cause < 0` 判断中断，因此传给 `interrupt_handler()` 的 `tf->cause` 通常包含第 63 位。处理中断原因时应先屏蔽第 63 位，不能直接用带有高位标志的完整值进行 `switch`。
-
-// 数据结构
-```c
-struct trapframe {
-    struct pushregs gpr;
-    uintptr_t status;
-    uintptr_t epc;
-    uintptr_t badvaddr;
-    uintptr_t cause;
-};
-```
-
-其中：
-
-- `tf->cause`：当前异常或中断的原因。
-- `tf->epc`：Trap 返回后将恢复到的程序计数器。处理同步异常时，应通过修改 `tf->epc` 跳过已经触发异常的指令。
-- `tf->status`、`tf->badvaddr` 和 `tf->gpr`：保存的 Trap 上下文，本任务只读使用。
-
-```c
-extern volatile size_t ticks;
-```
-
-`ticks` 已由 `clock_init()` 初始化为 0，并在每次 S 模式时钟中断发生时递增。
-
-// 可用函数
-```c
-static void print_ticks(void);
-void print_trapframe(struct trapframe *tf);
-void clock_set_next_event(void);
-int cprintf(const char *fmt, ...);
-
-static inline void trap_dispatch(struct trapframe *tf);
-```
-
-- `print_ticks()` 已实现，每调用一次输出 `100 ticks`。
-- `print_trapframe(tf)` 已实现，用于输出完整 Trap frame。
-- `clock_set_next_event()` 已实现，用于设置下一次时钟事件。
-- `trap_dispatch()` 已根据 `tf->cause` 的最高位选择调用 `interrupt_handler()` 或 `exception_handler()`。
-- `cprintf()` 支持 `%d`、`%x`、`%lx` 和 `%s` 等格式。
-
-当前工程中没有定义 `SHUTDOWN_AFTER`，当前 Lab3 评分要求也要求持续处理时钟中断直到至少 200 个 tick，因此本任务不要引用 `SHUTDOWN_AFTER`，不要在本模块中调用 `sbi_shutdown()`。
-
-[GUARANTEE]
-
-必须实现或修改的接口：
-```c
-void interrupt_handler(struct trapframe *tf);
-void exception_handler(struct trapframe *tf);
-```
-
-这两个函数必须具有外部链接，不能声明为 `static`，因为其他编译单元可能引用它们。函数签名不得修改。
-
-你可以根据需要添加：
-- 辅助函数，例如将中断原因与第 63 位分离、根据指令编码计算指令长度的函数；辅助函数建议设为 `static`
-- 本文件内部使用的宏定义
-- 本文件内部使用的静态变量
-
-[SPECIFICATION]
-
-## interrupt_handler
-
-**Pre-Condition**:
-- `tf` 是有效的 `struct trapframe *`。
-- 该函数由 `trap_dispatch()` 在识别到中断时调用；此时 `tf->cause` 通常包含第 63 位中断标志。
-- 某些测试或内部调用也可能直接传入只包含低 63 位原因码的 `tf->cause`，实现应能正确提取中断原因。
-
-**Post-Condition**:
-- 根据屏蔽第 63 位后的中断原因完成相应处理，并返回到 `trap_dispatch()` 和后续的 Trap 返回流程。
-- 时钟中断路径中，每次调用都必须使 `ticks` 增加 1，并保证下一次时钟事件已经被设置。
-- 除 `ticks` 的递增和必要的下一次时钟事件设置外，不得修改 `tf` 中保存的上下文。
-- 不得在处理函数中主动开启全局中断，不得修改 `trap_dispatch()` 的分发逻辑，也不得直接调用 `sret`。
-
-**Case 1**:
-- 当前中断原因是 `IRQ_S_TIMER` 时，执行一次时钟 tick 统计，并设置下一次时钟事件；每次 `ticks` 达到 `TICK_NUM` 的正整数倍时调用已有的 `print_ticks()`。下一次时钟事件必须在函数返回前设置，不能只在第一次中断时设置。处理结束后正常返回，不调用关机接口，不在函数内主动开启中断。
-
-**Case 2**:
-- 当前中断原因是 `IRQ_S_SOFT` 时，仅输出一行完全匹配 `Supervisor software interrupt\n` 的提示，不增加 `ticks`，不重新设置时钟事件，然后正常返回。
-
-**Case 3**:
-- 当前中断原因不是 `IRQ_S_TIMER` 或 `IRQ_S_SOFT` 时，先输出一行格式为 `Unknown interrupt: cause %d\n` 的信息，其中 `%d` 使用屏蔽最高位后的原因码；随后调用已有的 `print_trapframe(tf)` 输出完整 Trap frame，并正常返回，不得在该分支中 `panic` 或进入死循环。
-
-**Requirements**:
-- 中断原因必须通过与 `0x7fffffffffffffff` 等价的 64 位掩码或等价的位操作得到，不能把 `0x8000000000000005` 直接当作中断原因 5 使用。
-- 每次 S 模式时钟中断都必须调用 `clock_set_next_event()`，确保中断能够持续触发。
-- 时钟统计应基于全局 `ticks`；不得自行创建另一套独立计数变量。
-- 两个处理函数必须能够在正常处理后返回，使 `trap()` 返回 `__trapret`，最终由 `RESTORE_ALL` 和 `sret` 完成返回。
-- 不得修改 `print_ticks()` 的既有行为，也不得引用当前工程中未定义的 `SHUTDOWN_AFTER`。
-
-## exception_handler
-
-**Pre-Condition**:
-- `tf` 是有效的 `struct trapframe *`。
-- 该函数由 `trap_dispatch()` 在识别到同步异常时调用。
-- `tf->cause` 的最高位为 0，低 63 位保存同步异常原因。
-- `tf->epc` 保存触发异常的指令地址。
-
-**Post-Condition**:
-- 根据 `tf->cause` 完成异常分类和处理，并返回统一的 Trap 返回流程。
-- 对于断点和非法指令异常，`tf->epc` 必须推进到异常指令之后，避免 `sret` 后再次执行同一条指令。
-- 对于其他异常，输出当前 Trap frame，但不得修改函数签名或在默认分支中终止系统。
-
-**Case 1**:
-- 当前异常原因是 `CAUSE_BREAKPOINT` 时，先输出一行包含 `Breakpoint at 0x` 和原始 `tf->epc` 的提示，再根据当前指令的 2 字节或 4 字节编码将 `tf->epc` 推进相应长度。输出地址后不得再次原样返回同一指令。
-
-**Case 2**:
-- 当前异常原因是 `CAUSE_ILLEGAL_INSTRUCTION` 时，先输出一行包含 `Illegal instruction at 0x` 和原始 `tf->epc` 的提示，再根据当前非法指令的 2 字节或 4 字节编码将 `tf->epc` 推进相应长度。当前评分代码使用的是 4 字节非法指令，但实现应根据指令低两位编码判断实际长度，不要不加判断地假定所有异常都固定推进 4 字节。
-
-**Case 3**:
-- 当前异常原因不是 `CAUSE_BREAKPOINT` 或 `CAUSE_ILLEGAL_INSTRUCTION` 时，调用已有的 `print_trapframe(tf)` 输出完整 Trap frame，并正常返回。该分支不得输出后继续执行出错指令，不得直接修改 `sepc` CSR，也不得通过 `panic` 或死循环阻止测试继续运行。
-
-**Requirements**:
-- 必须通过修改 `tf->epc` 调整返回位置，不能直接写 `sepc`；后续 `RESTORE_ALL` 会根据 Trap frame 中的 `epc` 恢复 `sepc`。
-- 指令长度判断应遵循 RISC-V 指令编码规则：根据故障指令最低两位判断是否为 2 字节压缩指令；非法指令和断点指令的具体处理应使用实际长度推进。
-- 不得修改 `tf->cause`。
-- 不得修改 `trap_dispatch()`、`trap()`、Trap frame 布局或汇编入口。
-- 未知异常回退分支必须调用 `print_trapframe(tf)` 后返回，以便评分能够检查未知异常的 `cause 0x00000014` 输出。
-- 两个处理函数都必须能够在正常处理后返回，使 `trap()` 返回 `__trapret`，最终由 `RESTORE_ALL` 和 `sret` 完成返回。
-````
+（待补充）
 
 #### 实现迭代过程
 
-本模块的实现经历了 [1] 次有效编码迭代，过程如下：
-
----
-
-##### 第一次迭代
-
-实现前先阅读了 `kern/trap/trap.c`、`kern/trap/trap.h`、`kern/driver/clock.c`、`libs/riscv.h` 和评分测试，确认了以下事实：
-
-- `trap_dispatch()` 已经根据 `tf->cause` 的最高位完成中断与异常分类，本模块只需实现两个具体处理函数。
-- 时钟中断原因需要屏蔽最高位后才能与 `IRQ_S_TIMER` 比较；软件中断和未知中断测试也可能直接传入低 63 位原因码。
-- 断点和非法指令都属于同步异常，若不修改 `tf->epc`，`sret` 会返回同一条异常指令并形成循环。
-- 现有工程没有定义 `SHUTDOWN_AFTER`，评分脚本要求持续处理到 `ticks=200`，因此不能机械照搬指导书中提到的关机逻辑。
-
-**遇到的问题：**
-
-- 问题一：`scause` 的第 63 位是中断标志，时钟中断的完整值类似 `0x8000000000000005`，不能直接与宏 `IRQ_S_TIMER == 5` 比较。
-- 问题二：指导书提到达到 `SHUTDOWN_AFTER` 后关机，但当前工程既没有该宏，评分测试又要求在时钟中断持续返回后达到 200 tick。
-- 问题三：异常返回必须跳过故障指令，RISC-V 同时存在 2 字节压缩指令和 4 字节标准指令，不能简单假定所有异常都固定加 4。
-- 问题四：异常处理不能直接修改 `sepc`，因为后续 `RESTORE_ALL` 会用 Trap frame 中的 `tf->epc` 覆盖该 CSR。
-
-**问题解决策略：**
-
-- 针对问题一：在 `interrupt_handler()` 中先通过 `tf->cause & ~((uintptr_t)1 << 63)` 提取低 63 位原因，再使用局部变量进行 `switch`；不修改原 Trap frame 中的 `cause`。
-- 针对问题二：以当前工程代码和评分脚本为准，不引用未定义的 `SHUTDOWN_AFTER`，也不调用 `sbi_shutdown()`；时钟中断每次只负责计数、重装下一次事件和按周期打印。
-- 针对问题三：增加静态辅助函数 `instruction_length()`，读取故障指令并检查最低两位；最低两位为 `0b11` 时按 4 字节处理，否则按 2 字节压缩指令处理。
-- 针对问题四：断点和非法指令分支只修改 `tf->epc`，让后续汇编返回路径统一完成 CSR 恢复。
-- 对于未知中断：先打印屏蔽高位后的原因号，再调用 `print_trapframe(tf)`；对于未知异常：直接调用 `print_trapframe(tf)`。两条兜底路径都正常返回，不使用 `panic`。
-
-**最终结果：**
-
-首次实现完成后，时钟中断、软件中断、未知中断、断点、非法指令和未知异常路径均符合要求。运行 `make grade` 的结果为：
-
-```text
-trap entry, register restore, and breakpoint EPC: PASS (35/35)
-illegal instruction EPC advance and return: PASS (25/25)
-re-armed supervisor timer and repeated trap return: PASS (40/40)
-Total Score: 100/100
-```
-
-该结果说明：
-
-- Trap 入口能够正确保存和恢复上下文，断点处理后可以返回并继续执行。
-- 非法指令能够被识别，EPC 正确前移，不会重复执行故障指令。
-- 软件中断、未知中断和未知异常都能进入对应回退分支并正常返回。
-- 时钟中断能够持续重装，控制台按周期输出 `100 ticks`，最终达到 `ticks=200`。
-
-**关键改进点总结：**
-
-1. 严格按照 `scause` 的位含义提取中断原因，而不是直接比较带有最高位的完整值。
-2. 将“指令长度判断”独立为静态辅助函数，避免把异常恢复逻辑固定为 4 字节偏移。
-3. 通过修改 `tf->epc` 调整同步异常的返回地址，与现有 `RESTORE_ALL` 恢复 `sepc` 的机制保持一致。
-4. 所有未知类型都走可返回的打印兜底路径，不使用会阻塞测试的 `panic`。
-5. 以当前工程实际定义和评分要求为准，没有引入未定义的 `SHUTDOWN_AFTER` 或无关的关机、调度功能。
+（待补充）
 
 ---
 
@@ -536,46 +405,34 @@ Total Score: 100/100
 - 测试通过的结果（make grade），只有一个
 -->
 
+### 1. 阶段性验证（功能模块一、二）
 
-#### 1. 汇编验证
-
-将 `trapentry.S` 复制到临时目录，仅将框架既有 `SAVE_ALL` 中的 `sbadaddr` 替换为等价的 `stval`（CSR 0x143），使用 Makefile 的原始编译参数汇编：
-
-```text
-riscv64-unknown-elf-gcc -Ikern/trap/ -mcmodel=medany ... -c trapentry.S -o trapentry.o
-ASSEMBLE OK
-```
-
-#### 2. 反汇编检查
-
-`objdump` 确认关键指令序列：
+使用 Lab4 Makefile 的原始编译参数，对已修改的文件进行单独编译：
 
 ```text
-__alltraps:
-    ...
-    mv      a0,sp
-    jal     trap
-__trapret:
-    ld      s1,256(sp)
-    csrw    sstatus,s1
-    ld      s2,264(sp)
-    csrw    sepc,s2
-    ...
-    ld      sp,16(sp)      # x2 最后恢复
-    sret
+kern/mm/default_pmm.c   COMPILE OK
+kern/mm/pmm.c           COMPILE OK
+kern/trap/trap.c        COMPILE OK
+kern/trap/trapentry.S   ASSEMBLE OK
+kern/process/proc.c     COMPILE OK
 ```
 
-说明 `SAVE_ALL -> 传参 -> trap() -> RESTORE_ALL -> sret` 的闭环在指令层面是一致的。
+对当前工程做完整链接检查，剩余未定义符号仅有：
 
-#### 3. 运行截图展示
+```text
+undefined reference to `cpu_idle'
+```
 
-![make qemu](image/image.png)
+`page_insert`、`page_remove`、`proc_init` 等本报告已实现模块的符号均已解析；`cpu_idle` 属于功能模块三（调度）范围。
 
-![alt text](image/image-1.png)
 
-![alt text](image/image-2.png)
+### 2. make qemu 运行截图
 
-![alt text](image/image-3.png)
+（待补充：功能模块三完成后运行 `make qemu`，展示 `idleproc`/`initproc` 的创建与调度输出。）
+
+### 3. make grade 测试结果
+
+（待补充：功能模块三完成后运行 `make grade`，展示 Total Score 截图。）
 
 ---
 
@@ -583,9 +440,11 @@ __trapret:
 
 ### 对操作系统的理解
 
-本次实验把操作系统中“中断/异常”这一抽象落实到了具体的汇编与数据结构上。RISC-V 硬件在 Trap 发生时只自动保存少量信息（sepc、scause、stval、sstatus.SPIE/SPP 等）并跳转到 stvec，剩下的通用寄存器上下文必须由软件自己保存；而 `struct trapframe` 和 `SAVE_ALL`/`RESTORE_ALL` 正是软件约定的“现场快照”格式。实现 RESTORE_ALL 的关键不在于指令多少，而在于严格对应 SAVE_ALL 的实际布局，尤其是 x2(sp) 必须最后恢复这一点，否则 Trap frame 基址会被提前破坏。`__alltraps` 则体现了汇编入口与 C 处理函数之间的分工：汇编只负责保存现场、按调用约定传参和恢复现场，具体的中断语义交由 `trap()` 处理。
+本次实验把“进程/线程”这一抽象落实到了具体的数据结构与页表操作上。页表部分的关键不在于写出多少行代码，而在于理解“定位页表项 → 建立/撤销映射 → 维护引用计数 → 失效 TLB”这条链路的每个环节：`get_pte()` 负责定位与中间级页表分配，`page_insert()` 负责让虚拟地址真正指向物理页，引用计数决定物理页何时可以释放，TLB 失效保证硬件不会继续使用旧翻译。任何一个环节缺失，都会出现“页表看起来对、实际访问却错”的问题。
 
+进程部分则把 PCB、内核栈、trapframe 和 context 串成了完整的生命周期：`alloc_proc()` 只负责干净地创建对象，`kernel_thread()` 负责构造“新线程第一次运行”的现场模板，`do_fork()` 负责把资源组织成可运行实体，`copy_thread()` 负责把首次运行链路接到 `forkret → __trapret → kernel_thread_entry`。idleproc 的“直接复用当前执行现场”和 initproc 的“通过 kernel_thread 复制模板”两种创建路径，也让我更清楚地理解了内核线程与普通 fork 的区别。
 
 ### AI 协作开发的经验
 
-本次实验说明，向 AI 描述底层汇编任务时，“不要臆造布局、必须以现有代码为准”这类约束非常重要。提示词中给出前置条件、后置条件以及不得修改的接口（SAVE_ALL、trapframe、trap 签名、`__trapret`），使生成结果被限制在必要范围内，没有引入额外功能。同时，AI 生成的代码仍需人工核对：例如 sp 的恢复顺序、`sret` 前必须恢复 sstatus/sepc 等细节，需要通过阅读 SAVE_ALL 和反汇编来确认。遇到工具链与旧 CSR 名称不兼容的问题时，也更适合先区分“框架既有问题”与“本次实现问题”，在不违反实验约束的前提下用临时副本完成验证，而不是直接改动被禁止修改的代码。
+本次实验说明，向 AI 描述底层内核任务时，“以工程真实代码为准、不要臆造结构布局和接口”是最重要的约束。通过先阅读 `pmm.h`、`proc.h`、`trap.h`、`entry.S`、`switch.S`，再让 AI 按真实接口实现，才能得到可用结果。同时，AI 生成的代码仍需人工核对：例如 `page_ref_dec` 是否自动释放、`copy_thread` 的 `tf == NULL` 保护、idleproc 是否应挂入链表等细节，都需要结合工程实际和实验要求判断。
+

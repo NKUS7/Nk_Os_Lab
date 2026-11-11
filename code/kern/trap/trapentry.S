@@ -1,50 +1,48 @@
 #include <riscv.h>
 
     .macro SAVE_ALL
+    .align 2
 
     csrw sscratch, sp
 
     addi sp, sp, -36 * REGBYTES
-    # save x registers
-    STORE x0, 0*REGBYTES(sp)
-    STORE x1, 1*REGBYTES(sp)
-    STORE x3, 3*REGBYTES(sp)
-    STORE x4, 4*REGBYTES(sp)
-    STORE x5, 5*REGBYTES(sp)
-    STORE x6, 6*REGBYTES(sp)
-    STORE x7, 7*REGBYTES(sp)
-    STORE x8, 8*REGBYTES(sp)
-    STORE x9, 9*REGBYTES(sp)
-    STORE x10, 10*REGBYTES(sp)
-    STORE x11, 11*REGBYTES(sp)
-    STORE x12, 12*REGBYTES(sp)
-    STORE x13, 13*REGBYTES(sp)
-    STORE x14, 14*REGBYTES(sp)
-    STORE x15, 15*REGBYTES(sp)
-    STORE x16, 16*REGBYTES(sp)
-    STORE x17, 17*REGBYTES(sp)
-    STORE x18, 18*REGBYTES(sp)
-    STORE x19, 19*REGBYTES(sp)
-    STORE x20, 20*REGBYTES(sp)
-    STORE x21, 21*REGBYTES(sp)
-    STORE x22, 22*REGBYTES(sp)
-    STORE x23, 23*REGBYTES(sp)
-    STORE x24, 24*REGBYTES(sp)
-    STORE x25, 25*REGBYTES(sp)
-    STORE x26, 26*REGBYTES(sp)
-    STORE x27, 27*REGBYTES(sp)
-    STORE x28, 28*REGBYTES(sp)
-    STORE x29, 29*REGBYTES(sp)
-    STORE x30, 30*REGBYTES(sp)
-    STORE x31, 31*REGBYTES(sp)
+    # save gprs
+    STORE  x1,1*REGBYTES(sp)
+    STORE  x3,3*REGBYTES(sp)
+    STORE  x4,4*REGBYTES(sp)
+    STORE  x5,5*REGBYTES(sp)
+    STORE  x6,6*REGBYTES(sp)
+    STORE  x7,7*REGBYTES(sp)
+    STORE  x8,8*REGBYTES(sp)
+    STORE  x9,9*REGBYTES(sp)
+    STORE  x10,10*REGBYTES(sp)
+    STORE  x11,11*REGBYTES(sp)
+    STORE  x12,12*REGBYTES(sp)
+    STORE  x13,13*REGBYTES(sp)
+    STORE  x14,14*REGBYTES(sp)
+    STORE  x15,15*REGBYTES(sp)
+    STORE  x16,16*REGBYTES(sp)
+    STORE  x17,17*REGBYTES(sp)
+    STORE  x18,18*REGBYTES(sp)
+    STORE  x19,19*REGBYTES(sp)
+    STORE  x20,20*REGBYTES(sp)
+    STORE  x21,21*REGBYTES(sp)
+    STORE  x22,22*REGBYTES(sp)
+    STORE  x23,23*REGBYTES(sp)
+    STORE  x24,24*REGBYTES(sp)
+    STORE  x25,25*REGBYTES(sp)
+    STORE  x26,26*REGBYTES(sp)
+    STORE  x27,27*REGBYTES(sp)
+    STORE  x28,28*REGBYTES(sp)
+    STORE  x29,29*REGBYTES(sp)
+    STORE  x30,30*REGBYTES(sp)
+    STORE  x31,31*REGBYTES(sp)
 
     # get sr, epc, badvaddr, cause
-    # Set sscratch register to 0, so that if a recursive exception
-    # occurs, the exception vector knows it came from the kernel
-    csrrw s0, sscratch, x0
+    csrr s0, sscratch
     csrr s1, sstatus
     csrr s2, sepc
-    csrr s3, sbadaddr
+    csrr s3, 0x143
     csrr s4, scause
 
     STORE s0, 2*REGBYTES(sp)
@@ -55,8 +53,7 @@
     .endm
 
     .macro RESTORE_ALL
-
-    #lab3 function1 2412806
+    #lab3:填写你在lab3中实现的代码
     # Trap frame layout, as established by SAVE_ALL and struct trapframe:
     #   0*REGBYTES .. 31*REGBYTES : x0 .. x31 (x2 slot holds interrupted sp)
     #   32*REGBYTES               : sstatus
@@ -107,15 +104,13 @@
     # x2 (sp) must be restored last: sp is still the trap frame base until
     # this point, and SAVE_ALL stored the interrupted sp into the x2 slot.
     LOAD x2, 2*REGBYTES(sp)
-
     .endm
 
     .globl __alltraps
-    .align(2)
 __alltraps:
     SAVE_ALL
 
-    #lab3 function1 2412806
+    #lab3:填写你在lab3中实现的代码
     # SAVE_ALL leaves sp pointing at the trap frame, which is exactly the
     # first argument (struct trapframe *tf) of trap(); pass it in a0.
     move a0, sp
@@ -125,5 +120,11 @@ __alltraps:
     .globl __trapret
 __trapret:
     RESTORE_ALL
-    # return from supervisor call
+    # go back from supervisor call
     sret
+ 
+    .globl forkrets
+forkrets:
+    # set stack to this new process's trapframe
+    move sp, a0
+    j __trapret

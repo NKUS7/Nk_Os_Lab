@@ -18,3 +18,6 @@
 
 # Generated submission archive
 /code/proj*-handin.tar.gz
+
+# macOS
+.DS_Store
